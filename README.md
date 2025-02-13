@@ -1,2 +1,3 @@
 # Paxmata-examples
-A space to showcase sme examples of the paxmata source.
+A space to showcase some examples of the paxmata source.
+
