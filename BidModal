@@ -1,0 +1,211 @@
+import React, { useState, useContext, useEffect } from "react";
+import PropTypes from "prop-types";
+import { ethers } from "ethers";
+import { WalletContext } from "../../../context/WalletContext";
+import { NotificationContext } from "../../../context/NotificationContext";
+import { UserContext } from "../../../context/UserContext";
+import LoadingSpinner from "./Spinner";
+import apiClient from "../../../utils/apiClient";
+import styles from "./Styles/BidModal.module.css";
+
+const BidModal = ({ project, onRequestClose }) => {
+  const { signer, connectWallet } = useContext(WalletContext);
+  const { fetchNotifications } = useContext(NotificationContext);
+  const { user } = useContext(UserContext);
+
+  const [loading, setLoading] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
+  const [successMessage, setSuccessMessage] = useState("");
+  const [loadingMessage, setLoadingMessage] = useState("");
+  const [escrowAbi, setEscrowAbi] = useState(null);
+
+  const BID_AMOUNT = ethers.utils.parseUnits("0.001", "ether");
+
+  useEffect(() => {
+    fetchEscrowAbi();
+  }, []);
+
+  const fetchEscrowAbi = async () => {
+    try {
+      const response = await apiClient.get("/api/abi/PaxmataEscrow");
+      setEscrowAbi(response.data.abi);
+    } catch (error) {
+      console.error("Failed to load ABI:", error);
+      setErrorMessage("Failed to load contract configuration");
+    }
+  };
+
+  const placeBid = async () => {
+    if (!signer) {
+      try {
+        const walletConnectionResult = await connectWallet();
+        if (!walletConnectionResult.success) {
+          setErrorMessage(
+            walletConnectionResult.error || "Failed to connect wallet"
+          );
+          return;
+        }
+      } catch (error) {
+        setErrorMessage("Failed to connect wallet");
+        return;
+      }
+    }
+
+    if (!escrowAbi || !project._id) {
+      setErrorMessage("Contract configuration is not ready. Please try again.");
+      return;
+    }
+
+    setLoading(true);
+    setLoadingMessage("Processing your bid...");
+    setErrorMessage("");
+
+    try {
+      const escrowContract = new ethers.Contract(
+        project.escrowContractAddress,
+        escrowAbi,
+        signer
+      );
+
+      const Currency = {
+        DEV: 0,
+      };
+
+      console.log("Placing bid with parameters:", {
+        projectId: project.tokenId,
+        amount: BID_AMOUNT.toString(),
+        currency: Currency.DEV,
+      });
+
+      const provider = signer.provider;
+      const startBlock = await provider.getBlockNumber();
+
+      const tx = await escrowContract.approveAndPlaceBid(
+        project.tokenId,
+        BID_AMOUNT,
+        Currency.DEV,
+        { value: BID_AMOUNT }
+      );
+
+      setLoadingMessage("Confirming transaction...");
+      const receipt = await tx.wait();
+
+      const events = receipt.events || [];
+      console.log("Transaction events:", events);
+
+      const bidPlacedEvent = events.find((e) => e.event === "BidPlaced");
+      if (!bidPlacedEvent) {
+        throw new Error("BidPlaced event not found in transaction");
+      }
+
+      const [projectId, bidder, amount, currency, timestamp] =
+        bidPlacedEvent.args;
+      console.log("Bid event data:", {
+        projectId: projectId.toString(),
+        bidder,
+        amount: amount.toString(),
+        currency: currency.toString(),
+        timestamp: timestamp.toString(),
+      });
+
+      const pastEvents = await escrowContract.queryFilter(
+        escrowContract.filters.BidPlaced(project.tokenId),
+        startBlock,
+        receipt.blockNumber
+      );
+
+      const bidIndex = pastEvents.length - 1;
+
+      const bidData = {
+        tokenId: project.tokenId,
+        transactionHash: receipt.transactionHash,
+        bidIndex: bidIndex,
+        currency: "DEV",
+        amount: ethers.utils.formatEther(BID_AMOUNT),
+        userId: user?.id,
+        escrowAddress: project.escrowContractAddress,
+      };
+
+      console.log("Sending bid data to backend:", bidData);
+
+      await apiClient.post("/api/payments/place-bid", bidData);
+
+      setSuccessMessage("Bid placed successfully!");
+      fetchNotifications();
+
+      setTimeout(onRequestClose, 2000);
+    } catch (error) {
+      console.error("Error placing bid:", error);
+      let errorMsg = "Failed to place bid";
+
+      if (error.data?.message) {
+        errorMsg = error.data.message;
+      } else if (error.message) {
+        errorMsg = error.message;
+      }
+
+      setErrorMessage(errorMsg);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className={styles.modalOverlay} onClick={onRequestClose}>
+      <div className={styles.modalContent} onClick={(e) => e.stopPropagation()}>
+        <h1>Place Your Bid</h1>
+
+        <div className={styles.projectDetails}>
+          <p>
+            <strong>Project:</strong> {project.title}
+          </p>
+          <p>
+            <strong>Bid Amount:</strong> {ethers.utils.formatEther(BID_AMOUNT)}{" "}
+            DEV
+          </p>
+        </div>
+
+        {loading && <LoadingSpinner message={loadingMessage} />}
+        {errorMessage && (
+          <p className={styles.error} role="alert">
+            {errorMessage}
+          </p>
+        )}
+        {successMessage && (
+          <p className={styles.success} role="status">
+            {successMessage}
+          </p>
+        )}
+
+        <div className={styles.buttonGroup}>
+          <button
+            onClick={placeBid}
+            disabled={loading || !escrowAbi || !project._id}
+            className={styles.primaryButton}
+          >
+            {loading ? "Processing..." : "Place Bid"}
+          </button>
+          <button
+            onClick={onRequestClose}
+            disabled={loading}
+            className={styles.secondaryButton}
+          >
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+BidModal.propTypes = {
+  project: PropTypes.shape({
+    _id: PropTypes.string.isRequired,
+    title: PropTypes.string.isRequired,
+    escrowContractAddress: PropTypes.string.isRequired,
+    tokenId: PropTypes.string.isRequired,
+  }).isRequired,
+  onRequestClose: PropTypes.func.isRequired,
+};
+
+export default BidModal;
